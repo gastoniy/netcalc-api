@@ -1,0 +1,28 @@
+FROM cgr.dev/chainguard/python:latest-dev AS builder
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /build
+
+RUN python -m venv /build/venv
+
+ENV PATH="/build/venv/bin:$PATH"
+
+COPY --chown=nonroot:nonroot requirements.txt .
+
+RUN pip install --no-cache-dir -r requirements.txt
+
+
+FROM cgr.dev/chainguard/python:latest AS final
+
+WORKDIR /application
+
+COPY --from=builder --chown=nonroot:nonroot /build/venv /application/venv/
+COPY --chown=nonroot:nonroot /app /application/app
+
+ENV PATH="/application/venv/bin:$PATH"
+
+ENV PYTHONPATH="/application/venv/lib/python3.14/site-packages:/application/app"
+
+CMD ["-m", "app"]
