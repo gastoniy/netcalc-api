@@ -16,6 +16,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 FROM cgr.dev/chainguard/python:latest AS final
 
+# Overridable at build time:
+# --build-arg APP_VERSION=$(git rev-parse --short HEAD)
+ARG APP_VERSION
+ENV APP_VERSION=${APP_VERSION} \
+    PYTHONUNBUFFERED=1
+
 WORKDIR /application
 
 COPY --from=builder --chown=nonroot:nonroot /build/venv /application/venv/
@@ -24,5 +30,7 @@ COPY --chown=nonroot:nonroot /app /application/app
 ENV PATH="/application/venv/bin:$PATH"
 
 ENV PYTHONPATH="/application/venv/lib/python3.14/site-packages:/application/app"
+
+EXPOSE 8000
 
 CMD ["-m", "app"]
