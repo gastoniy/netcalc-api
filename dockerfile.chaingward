@@ -33,4 +33,5 @@ ENV PYTHONPATH="/application/venv/lib/python3.14/site-packages:/application/app"
 
 EXPOSE 8000
 
+# Standard image entrypoint is "python", so there is no need to override it
 CMD ["-m", "app"]
