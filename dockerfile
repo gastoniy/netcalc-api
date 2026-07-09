@@ -1,0 +1,32 @@
+# Stage 1: Builder
+FROM python:3.12-slim AS builder
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /build
+
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Stage 2: Hardened Debian Slim Final
+FROM python:3.12-slim AS final
+
+WORKDIR /application
+
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1
+
+# Create an unprivileged user to mimic distroless security
+RUN groupadd -g 1001 appuser && useradd -u 1001 -g appuser appuser
+
+COPY --chown=appuser:appuser --from=builder /opt/venv /opt/venv
+COPY --chown=appuser:appuser app/ /application/app/
+
+USER appuser
+EXPOSE 8000
+
+ENTRYPOINT [ "python", "-m", "app" ]
