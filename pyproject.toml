@@ -1,6 +1,6 @@
 [tool.ruff]
 line-length = 88
-target-version = "py312"
+target-version = "py313"
 
 [tool.ruff.lint]
 # pycodestyle, pyflakes, isort, bugbear, flake8-bandit (security).
@@ -13,3 +13,4 @@ select = ["E", "F", "I", "B", "S"]
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+pythonpath = ["."]
