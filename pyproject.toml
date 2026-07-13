@@ -1,5 +1,7 @@
 [tool.ruff]
 line-length = 88
+# Should track the runtime (the Chainguard base ships Python 3.14, ADR-0003), but
+# ruff 0.9.2 only understands up to py313 — `py314` is a hard TOML parse error.
 target-version = "py313"
 
 [tool.ruff.lint]

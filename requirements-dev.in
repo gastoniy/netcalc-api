@@ -1,0 +1,7 @@
+# Direct dev dependencies. Edit this file, never requirements-dev.txt.
+# Regenerate the lock with:
+#   pip-compile --generate-hashes --output-file=requirements-dev.txt requirements-dev.in
+-r requirements.in
+pytest==8.3.4
+httpx==0.28.1
+ruff==0.9.2

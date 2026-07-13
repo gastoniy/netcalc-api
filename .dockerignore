@@ -1,0 +1,30 @@
+# The build context should carry only what the image needs: app/ and the lock.
+# Everything else is excluded so unrelated edits don't bust the layer cache, and
+# so a future `COPY . .` can't sweep in secrets or git history.
+
+.git/
+.github/
+.gitignore
+
+tests/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+
+docs/
+*.md
+LICENSE
+
+.vscode/
+.claude/
+.venv/
+venv/
+
+# Alternative bases kept for documentation; never part of a build (ADR-0003).
+dockerfile.*
+
+# Sources for the compiled locks; the image installs from requirements.txt only.
+requirements*.in
+requirements-dev.txt
+pyproject.toml
