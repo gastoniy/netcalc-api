@@ -103,8 +103,8 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # fail-closed on HIGH/CRITICAL, ignore unfixed (everything else on Security tab)
-      - name: Trivy scan (fail on HIGH/CRITICAL)
+      # Fail closed on HIGH/CRITICAL that have a fix available
+      - name: Trivy scan (fail on fixable HIGH/CRITICAL)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: netcalc-api:ci
@@ -119,6 +119,7 @@ jobs:
         uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
         with:
           sarif_file: trivy-results.sarif
+          category: trivy # keep Trivy's and Grype's results as distinct result sets
 
       # Proves the container actually boots and serves real traffic
       - name: Smoke test
@@ -174,6 +175,7 @@ jobs:
       packages: write # push to GHCR
       id-token: write # keyless signing + provenance OIDC
       attestations: write # actions/attest-build-provenance
+      security-events: write # upload the Grype SARIF to the Security tab
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -223,13 +225,30 @@ jobs:
           format: cyclonedx-json
           output-file: sbom.cdx.json
 
-      - name: Grype scan of the SBOM (fail on high)
+      - name: Grype scan of the SBOM (fail on fixable high)
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
         with:
           sbom: sbom.cdx.json
           fail-build: true
           severity-cutoff: high
+          only-fixed: true
           output-format: table
+
+      - name: Grype full report (non-blocking, all severities)
+        id: grype-full
+        if: always()
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          sbom: sbom.cdx.json
+          fail-build: false
+          output-format: sarif
+
+      - name: Upload Grype SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
+        with:
+          sarif_file: ${{ steps.grype-full.outputs.sarif }}
+          category: grype
 
       - name: Sign image (keyless)
         run: cosign sign --yes ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
