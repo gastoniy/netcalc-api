@@ -1,100 +1,270 @@
+# Flow: lint -> test -> build (build-local -> verify base -> scan -> smoke) ->
+#       release-only-on-main (push -> SBOM -> grype -> sign -> attest ->
+#       provenance -> verify)
+
 name: CI Pipeline
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}  # username/repo-name
+  IMAGE_NAME: ${{ github.repository }} # gastoniy/netcalc-api
 
 jobs:
   lint:
     name: Lint Codebase
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
-    
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Python 3.14
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.14"
-          cache: 'pip'
+          cache: "pip"
 
-      - name: Install dependencies (all) for linting stage
-        run: pip install -r requirements-dev.txt
+      - name: Install dev dependencies
+        run: pip install --require-hashes -r requirements-dev.txt
 
-      - name: Run Ruff (Style & Security)
+      - name: Ruff (style + flake8-bandit security)
         run: ruff check .
-
   test:
-    name: Run Unit Tests
+    name: Run Tests
     needs: lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Python 3.14
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.14"
-          cache: 'pip'
+          cache: "pip"
 
-      - name: Install dependencies (all) for testing stage
-        run: pip install -r requirements-dev.txt
+      - name: Install dev dependencies
+        run: pip install --require-hashes -r requirements-dev.txt
 
-      - name: Run Pytest
-        run: pytest
+      - name: Pytest
+        run: python -m pytest   # the -m form puts the repo root on sys.path so import app resolves
+  build:
+    name: Build, Scan & Smoke Test
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write # upload Trivy SARIF to the Security tab
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-  build-and-push:
-      name: Build & Push to GHCR
-      needs: test
-      runs-on: ubuntu-latest
-      permissions:
-        contents: read
-        packages: write
-      
-      steps:
-        - name: Checkout repository
-          uses: actions/checkout@v4
+      - name: Compute short SHA
+        run: echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
 
-        - name: Log in to GitHub Container Registry
-          uses: docker/login-action@v3
-          with:
-            registry: ${{ env.REGISTRY }}
-            username: ${{ github.actor }}
-            password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
-        - name: Extract Docker metadata
-          id: meta
-          uses: docker/metadata-action@v5
-          with:
-            images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-            tags: |
-              type=sha,format=long
-              type=ref,event=branch
-              type=raw,value=latest,enable={{is_default_branch}}
+      # verify the Chainguard base image was really built by Chainguard BEFORE building on top of it
+      - name: Verify base image provenance
+        run: | # Digest is read straight from the Dockerfile (so drift is impossible)
+          BASE=$(grep -E '^FROM .* AS final' Dockerfile | awk '{print $2}')
+          echo "Verifying base: $BASE"
+          cosign verify \
+            --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+            --certificate-identity=https://github.com/chainguard-images/images/.github/workflows/release.yaml@refs/heads/main \
+            "$BASE"
 
-        - name: Get Short Git SHA
-          run: echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
-        - name: Build and push Docker image
-          id: build
-          uses: docker/build-push-action@v5
-          with:
-            context: .
-            file: Dockerfile
-            push: ${{ github.event_name != 'pull_request' }}
-            tags: ${{ steps.meta.outputs.tags }}
-            build-args: |
-              APP_VERSION=${{ env.SHORT_SHA }}
+      # Build into the local Docker daemon only
+      - name: Build image (local, not pushed)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          tags: netcalc-api:ci
+          build-args: |
+            APP_VERSION=${{ env.SHORT_SHA }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # fail-closed on HIGH/CRITICAL, ignore unfixed (everything else on Security tab)
+      - name: Trivy scan (fail on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: netcalc-api:ci
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF
+        if: always() # upload findings even when the scan failed the job
+        uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
+        with:
+          sarif_file: trivy-results.sarif
+
+      # Proves the container actually boots and serves real traffic
+      - name: Smoke test
+        run: |
+          docker run -d --name smoke -p 8000:8000 netcalc-api:ci
+          echo "Waiting for the app to come up..."
+          for i in $(seq 1 10); do
+            if curl -sf http://localhost:8000/healthz; then
+              echo "healthz is up"; break
+            fi
+            sleep 2
+          done
+
+          echo "Health endpoints:"
+          curl -sf http://localhost:8000/healthz
+          curl -sf http://localhost:8000/readyz
+
+          echo "Real calculator request:"
+          curl -sf "http://localhost:8000/api/v1/subnet?cidr=192.168.1.0/24" \
+            | jq -e '.network_address == "192.168.1.0" and .num_usable_hosts == 254'
+
+          # the running app must report the very SHA we built it from.
+          echo "Version plumbing (expect ${SHORT_SHA}):"
+          curl -sf http://localhost:8000/ \
+            | jq -e --arg v "$SHORT_SHA" '.version == $v'
+
+          # Hardening assertions on the image itself.
+          echo "Image runs as nonroot:"
+          test "$(docker inspect --format '{{.Config.User}}' netcalc-api:ci)" = "65532"
+
+          echo "Image is genuinely distroless (no shell):"
+          if docker exec smoke sh -c 'echo pwned' 2>/dev/null; then
+            echo "FAIL: a shell is present in the runtime image"; exit 1
+          fi
+          echo "OK: no shell in the runtime image"
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs smoke || true
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f smoke || true
+
+  release:
+    name: Push, Sign & Attest
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write # push to GHCR
+      id-token: write # keyless signing + provenance OIDC
+      attestations: write # actions/attest-build-provenance
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Compute short SHA
+        run: echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata (tags only)
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build & push (cache-identical to the tested image)
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            APP_VERSION=${{ env.SHORT_SHA }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Everything below targets the pushed image BY DIGEST
+      - name: Generate SBOM (CycloneDX) from the pushed image
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+
+      - name: Grype scan of the SBOM (fail on high)
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          sbom: sbom.cdx.json
+          fail-build: true
+          severity-cutoff: high
+          output-format: table
+
+      - name: Sign image (keyless)
+        run: cosign sign --yes ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+
+      - name: Attest SBOM
+        run: |
+          cosign attest --yes \
+            --predicate sbom.cdx.json \
+            --type cyclonedx \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+
+      - name: Generate SLSA build provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify signature (fail closed)
+        run: |
+          cosign verify \
+            --certificate-identity=${{ github.server_url }}/${{ github.repository }}/.github/workflows/ci.yml@${{ github.ref }} \
+            --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+
+      - name: Verify SBOM attestation (fail closed)
+        run: |
+          cosign verify-attestation \
+            --type cyclonedx \
+            --certificate-identity=${{ github.server_url }}/${{ github.repository }}/.github/workflows/ci.yml@${{ github.ref }} \
+            --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom-${{ env.SHORT_SHA }}
+          path: sbom.cdx.json
