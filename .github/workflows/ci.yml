@@ -22,6 +22,32 @@ env:
   IMAGE_NAME: ${{ github.repository }} # gastoniy/netcalc-api
 
 jobs:
+  changes:
+    name: Detect image-relevant changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read # paths-filter reads the PR's file list
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - id: filter
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        with:
+          filters: |
+            code:
+              - 'app/**'
+              - 'tests/**'
+              - 'Dockerfile'
+              - '.dockerignore'
+              - 'requirements*.in'
+              - 'requirements*.txt'
+              - 'pyproject.toml'
+              - '.github/workflows/ci.yml'
+
   lint:
     name: Lint Codebase
     runs-on: ubuntu-latest
@@ -65,7 +91,8 @@ jobs:
         run: python -m pytest   # the -m form puts the repo root on sys.path so import app resolves
   build:
     name: Build, Scan, Smoke & Push
-    needs: test
+    needs: [test, changes]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
