@@ -1,6 +1,9 @@
-# Flow: lint -> test -> build (build-local -> verify base -> scan -> smoke) ->
-#       release-only-on-main (push -> SBOM -> grype -> sign -> attest ->
-#       provenance -> verify)
+# Flow: lint -> test
+#       -> build   ONE build, then EVERY gate, then publish:
+#                  build-local -> verify base -> trivy -> SBOM -> grype -> smoke
+#                  -> [main only] push that exact image -> emit digest
+#       -> release notarise only (no build, no scan):
+#                  sign -> attest SBOM -> SLSA provenance -> verify x2
 
 name: CI Pipeline
 
@@ -61,13 +64,16 @@ jobs:
       - name: Pytest
         run: python -m pytest   # the -m form puts the repo root on sys.path so import app resolves
   build:
-    name: Build, Scan & Smoke Test
+    name: Build, Scan, Smoke & Push
     needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read
-      security-events: write # upload Trivy SARIF to the Security tab
+      packages: write # push the tested image to GHCR
+      security-events: write # upload Trivy + Grype SARIF to the Security tab
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -92,7 +98,6 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
-      # Build into the local Docker daemon only
       - name: Build image (local, not pushed)
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
@@ -122,6 +127,45 @@ jobs:
         with:
           sarif_file: trivy-results.sarif
           category: trivy # keep Trivy's and Grype's results as distinct result sets
+
+      # The SBOM is generated from the LOCAL tested image, not from a registry repull
+      - name: Generate SBOM (CycloneDX) from the tested image
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: netcalc-api:ci
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+
+      - name: Grype scan of the SBOM (fail on fixable high)
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          sbom: sbom.cdx.json
+          fail-build: true
+          severity-cutoff: high
+          only-fixed: true
+          output-format: table
+
+      - name: Grype full report (non-blocking, all severities)
+        id: grype-full
+        if: always()
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          sbom: sbom.cdx.json
+          fail-build: false
+          output-format: sarif
+
+      - name: Upload Grype SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
+        with:
+          sarif_file: ${{ steps.grype-full.outputs.sarif }}
+          category: grype
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom-${{ env.SHORT_SHA }}
+          path: sbom.cdx.json
 
       # Proves the container actually boots and serves real traffic
       - name: Smoke test
@@ -166,20 +210,67 @@ jobs:
         if: always()
         run: docker rm -f smoke || true
 
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata (tags only)
+        id: meta
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Push tested image
+        id: push
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          DIGEST=""
+          while read -r tag; do
+            [ -n "$tag" ] || continue
+            echo "--- pushing $tag ---"
+            docker tag netcalc-api:ci "$tag"
+            # all tags share one manifest, so every push reports the same digest
+            DIGEST=$(docker push "$tag" | awk '/digest: sha256:/ {print $3}')
+          done <<< "$TAGS"
+
+          if [ -z "$DIGEST" ]; then
+            echo "::error::failed to capture a digest from docker push"
+            exit 1
+          fi
+          echo "pushed digest: $DIGEST"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
   release:
-    name: Push, Sign & Attest
+    name: Sign & Attest
     needs: build
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read
-      packages: write # push to GHCR
+      packages: write # cosign writes the signature + attestation layers to GHCR
       id-token: write # keyless signing + provenance OIDC
       attestations: write # actions/attest-build-provenance
-      security-events: write # upload the Grype SARIF to the Security tab
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # Safety net for the digest hand-off
+      - name: Require a digest from build
+        run: |
+          if [ -z "${{ needs.build.outputs.digest }}" ]; then
+            echo "::error::build produced no digest — refusing to sign"
+            exit 1
+          fi
+          echo "notarising ${{ needs.build.outputs.digest }}"
 
       - name: Compute short SHA
         run: echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
@@ -189,9 +280,6 @@ jobs:
         with:
           cosign-release: v3.1.1
 
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
-
       - name: Log in to GHCR
         uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
@@ -199,81 +287,35 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Docker metadata (tags only)
-        id: meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+      - name: Download the gated SBOM
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=sha,format=long
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      - name: Build & push (cache-identical to the tested image)
-        id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        with:
-          context: .
-          file: Dockerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          build-args: |
-            APP_VERSION=${{ env.SHORT_SHA }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      # Everything below targets the pushed image BY DIGEST
-      - name: Generate SBOM (CycloneDX) from the pushed image
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
-        with:
-          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
-          format: cyclonedx-json
-          output-file: sbom.cdx.json
-
-      - name: Grype scan of the SBOM (fail on fixable high)
-        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
-        with:
-          sbom: sbom.cdx.json
-          fail-build: true
-          severity-cutoff: high
-          only-fixed: true
-          output-format: table
-
-      - name: Grype full report (non-blocking, all severities)
-        id: grype-full
-        if: always()
-        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
-        with:
-          sbom: sbom.cdx.json
-          fail-build: false
-          output-format: sarif
-
-      - name: Upload Grype SARIF
-        if: always()
-        uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
-        with:
-          sarif_file: ${{ steps.grype-full.outputs.sarif }}
-          category: grype
+          name: sbom-${{ env.SHORT_SHA }}
 
       - name: Sign image (keyless)
-        run: cosign sign --yes ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.digest }}
+        run: cosign sign --yes "$IMAGE"
 
       - name: Attest SBOM
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.digest }}
         run: |
           cosign attest --yes \
             --predicate sbom.cdx.json \
             --type cyclonedx \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+            "$IMAGE"
 
       - name: Generate SLSA build provenance
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          subject-digest: ${{ steps.build.outputs.digest }}
+          subject-digest: ${{ needs.build.outputs.digest }}
           push-to-registry: true
 
       - name: Verify signature (fail closed)
         env:
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.digest }}
           IDENTITY: ${{ github.server_url }}/${{ github.repository }}/.github/workflows/ci.yml@${{ github.ref }}
           ISSUER: https://token.actions.githubusercontent.com
         run: |
@@ -283,7 +325,7 @@ jobs:
             "$IMAGE"
       - name: Verify SBOM attestation (fail closed)
         env:
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.digest }}
           IDENTITY: ${{ github.server_url }}/${{ github.repository }}/.github/workflows/ci.yml@${{ github.ref }}
           ISSUER: https://token.actions.githubusercontent.com
         run: |
@@ -292,9 +334,3 @@ jobs:
             --certificate-identity="$IDENTITY" \
             --certificate-oidc-issuer="$ISSUER" \
             "$IMAGE" > /dev/null
-
-      - name: Upload SBOM artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: sbom-${{ env.SHORT_SHA }}
-          path: sbom.cdx.json
