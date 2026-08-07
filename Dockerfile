@@ -1,4 +1,4 @@
-FROM cgr.dev/chainguard/python:latest-dev@sha256:92b8a0af0e138d8f3d169ac3fc92fc691c9f66aa16a6e0fd8d429b645ec349f1 AS builder
+FROM cgr.dev/chainguard/python:latest-dev@sha256:981b5015ffe6453e95611db91e50bf39afa325a304c54f64968a6fd87729d3b4 AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
@@ -16,7 +16,7 @@ RUN pip install --no-cache-dir --require-hashes \
     --target=/build/venv/lib/python3.14/site-packages \
     -r requirements.txt
 
-FROM cgr.dev/chainguard/python:latest@sha256:231d4a76e8521327dbb3c23094b2c41151501845d2656da3c1a0610981c496c5 AS final
+FROM cgr.dev/chainguard/python:latest@sha256:5128c3823542cfb27fd83c42ef9ee3bbbf3fdd0eb9190802e5fc119974c5f776 AS final
 
 # Overridable at build time (default is dev):
 # --build-arg APP_VERSION=$(git rev-parse --short HEAD)
