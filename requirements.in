@@ -2,5 +2,5 @@
 # Regenerate the lock with:
 #   pip-compile --generate-hashes --output-file=requirements.txt requirements.in
 fastapi==0.141.1
-uvicorn==0.52.1
+uvicorn==0.52.4
 prometheus-client==0.26.0
