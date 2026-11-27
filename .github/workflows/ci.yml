@@ -2,7 +2,7 @@
 #       -> build   ONE build, then EVERY gate, then publish:
 #                  build-local -> verify base
 #                  -> [PR only] baseline scan of :latest -> ignore lists (ADR-0016)
-#                  -> trivy -> SBOM -> grype -> smoke
+#                  -> trivy gate + trivy report -> SBOM -> grype gate + grype report -> smoke
 #                  -> [main only] push that exact image -> emit digest
 #       -> release notarise only (no build, no scan):
 #                  sign -> attest SBOM -> SLSA provenance -> verify x2
@@ -132,6 +132,7 @@ jobs:
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - name: Build image (local, not pushed)
+        id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
@@ -208,28 +209,48 @@ jobs:
           echo "--- Grype ---"; cat .grype.yaml
           echo "::endgroup::"
 
-      # Fail closed on HIGH/CRITICAL that have a fix available
-      # (on PRs: only those NOT already present in :latest)
-      - name: Trivy scan (fail on fixable HIGH/CRITICAL)
+      # GATE: fail closed on HIGH/CRITICAL that have a fix available
+      # (on PRs: only those NOT already present in :latest).
+      # format: table on purpose - with format: sarif, trivy-action drops `severity`
+      # ("Building SARIF report with all severities") and exit-code then fires on
+      # fixable MEDIUM/LOW too. Table output also puts the findings in the log.
+      - name: Trivy gate (fail on fixable HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: netcalc-api:ci
+          format: table
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          trivyignores: .trivyignore.baseline # empty on main = absolute policy
+          scanners: vuln
+
+      # REPORT: every severity, no ignore list, never blocks (ADR-0014: surface everything)
+      - name: Trivy full report (non-blocking, all severities)
+        id: trivy-report
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: netcalc-api:ci
           format: sarif
           output: trivy-results.sarif
-          exit-code: "1"
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
-          trivyignores: .trivyignore.baseline # empty on main = absolute policy
+          exit-code: "0"
+          scanners: vuln
 
       - name: Upload Trivy SARIF
-        if: always() # upload findings even when the scan failed the job
+        if: ${{ !cancelled() && steps.trivy-report.outcome == 'success' }}
         uses: github/codeql-action/upload-sarif@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4.37.8
         with:
           sarif_file: trivy-results.sarif
           category: trivy # keep Trivy's and Grype's results as distinct result sets
 
       # The SBOM is generated from the LOCAL tested image, not from a registry repull
+      # Report steps depend on their real inputs, not on always(): a failed gate must not
+      # make later steps run against files that were never produced (empty SARIF, etc.).
+      # Push steps keep the default success() condition, so any failed gate = no push.
       - name: Generate SBOM (CycloneDX) from the tested image
+        id: sbom
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           image: netcalc-api:ci
@@ -238,6 +259,7 @@ jobs:
 
       # Grype reads ./.grype.yaml (written above): baseline IDs on PRs, empty on main
       - name: Grype scan of the SBOM (fail on fixable high)
+        if: ${{ !cancelled() && steps.sbom.outcome == 'success' }}
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
         with:
           sbom: sbom.cdx.json
@@ -248,7 +270,7 @@ jobs:
 
       - name: Grype full report (non-blocking, all severities)
         id: grype-full
-        if: always()
+        if: ${{ !cancelled() && steps.sbom.outcome == 'success' }}
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
         with:
           sbom: sbom.cdx.json
@@ -256,13 +278,14 @@ jobs:
           output-format: sarif
 
       - name: Upload Grype SARIF
-        if: always()
+        if: ${{ !cancelled() && steps.grype-full.outcome == 'success' }}
         uses: github/codeql-action/upload-sarif@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4.37.8
         with:
           sarif_file: ${{ steps.grype-full.outputs.sarif }}
           category: grype
 
       - name: Upload SBOM artifact
+        if: ${{ !cancelled() && steps.sbom.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sbom-${{ env.SHORT_SHA }}
