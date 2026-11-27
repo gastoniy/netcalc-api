@@ -13,8 +13,7 @@ COPY --chown=nonroot:nonroot requirements.txt .
 
 # --require-hashes: every wheel must match a sha256 recorded in the lock, so a
 RUN pip install --no-cache-dir --require-hashes \
-    --target=/build/venv/lib/python3.14/site-packages \
-    -r requirements.txt
+    --target=/build/site-packages -r requirements.txt
 
 FROM cgr.dev/chainguard/python:latest@sha256:9c4bfa852765da1bfb86d4d500c3333db1c0929c4b9845a90ca7d199d857f90c AS final
 
@@ -32,12 +31,10 @@ LABEL org.opencontainers.image.title="netcalc-api" \
 
 WORKDIR /application
 
-COPY --from=builder --chown=nonroot:nonroot /build/venv /application/venv/
+COPY --from=builder --chown=nonroot:nonroot /build/site-packages /application/site-packages
 COPY --chown=nonroot:nonroot /app /application/app
 
-ENV PATH="/application/venv/bin:$PATH"
-
-ENV PYTHONPATH="/application/venv/lib/python3.14/site-packages:/application"
+ENV PYTHONPATH="/application/site-packages:/application"
 
 EXPOSE 8000
 

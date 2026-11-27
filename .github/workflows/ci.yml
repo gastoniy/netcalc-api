@@ -145,7 +145,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name : Assert image Python matches .python-version
+      - name: Assert image Python matches .python-version
         run: |
           WANT=$(cut -d. -f1,2 .python-version)
           GOT=$(docker run --rm --entrypoint /usr/bin/python netcalc-api:ci \
