@@ -1,9 +1,15 @@
 # Flow: lint -> test
 #       -> build   ONE build, then EVERY gate, then publish:
-#                  build-local -> verify base -> trivy -> SBOM -> grype -> smoke
+#                  build-local -> verify base
+#                  -> [PR only] baseline scan of :latest -> ignore lists (ADR-0016)
+#                  -> trivy -> SBOM -> grype -> smoke
 #                  -> [main only] push that exact image -> emit digest
 #       -> release notarise only (no build, no scan):
 #                  sign -> attest SBOM -> SLSA provenance -> verify x2
+#
+# Gate semantics (ADR-0016):
+#   pull_request -> differential: fail only on fixable HIGH/CRITICAL NOT already in :latest
+#   push to main -> absolute:     fail on ANY fixable HIGH/CRITICAL; nothing is published
 
 name: CI Pipeline
 
@@ -137,7 +143,73 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # Differential gate (PR only, ADR-0016)
+      # Baseline = last published image. `latest` only moves after every gate passed,
+      # so it is "last known good". Findings already in it are not this PR's fault.
+      # These two scans MUST run before the ignore files exist.
+      - name: Trivy baseline (last published image)
+        if: github.event_name == 'pull_request'
+        continue-on-error: true # first-ever run / registry hiccup -> empty baseline = absolute policy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          format: json
+          output: trivy-baseline.json
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "0"
+
+      - name: Grype baseline (last published image)
+        id: grype-baseline
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          fail-build: false
+          only-fixed: true
+          output-format: json
+
+      # Both files ALWAYS exist so the gate behaviour is explicit, never implicit:
+      #   push to main -> empty lists  -> absolute policy
+      #   pull_request -> baseline IDs -> differential policy
+      # Failure mode is safe: if a baseline scan failed, its list is empty -> stricter, not looser.
+      - name: Build ignore lists from baseline
+        env:
+          GRYPE_JSON: ${{ steps.grype-baseline.outputs.json }}
+        run: |
+          set -euo pipefail
+          : > .trivyignore.baseline
+          echo "ignore: []" > .grype.yaml
+
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "push to main: absolute policy, no baseline"
+            exit 0
+          fi
+
+          if [ -s trivy-baseline.json ]; then
+            jq -r '.Results[]?.Vulnerabilities[]?.VulnerabilityID' trivy-baseline.json \
+              | sort -u > .trivyignore.baseline
+          else
+            echo "::warning::No Trivy baseline available - PR gated by absolute policy"
+          fi
+
+          if [ -n "${GRYPE_JSON:-}" ] && [ -s "$GRYPE_JSON" ]; then
+            IDS=$(jq -r '.matches[]?.vulnerability.id' "$GRYPE_JSON" | sort -u)
+            if [ -n "$IDS" ]; then
+              { echo "ignore:"; echo "$IDS" | sed 's/^/  - vulnerability: /'; } > .grype.yaml
+            fi
+          else
+            echo "::warning::No Grype baseline available - PR gated by absolute policy"
+          fi
+
+          echo "::group::Pre-existing findings inherited from :latest (not blocking this PR)"
+          echo "--- Trivy ---"; cat .trivyignore.baseline
+          echo "--- Grype ---"; cat .grype.yaml
+          echo "::endgroup::"
+
       # Fail closed on HIGH/CRITICAL that have a fix available
+      # (on PRs: only those NOT already present in :latest)
       - name: Trivy scan (fail on fixable HIGH/CRITICAL)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -147,6 +219,7 @@ jobs:
           exit-code: "1"
           severity: CRITICAL,HIGH
           ignore-unfixed: true
+          trivyignores: .trivyignore.baseline # empty on main = absolute policy
 
       - name: Upload Trivy SARIF
         if: always() # upload findings even when the scan failed the job
@@ -163,6 +236,7 @@ jobs:
           format: cyclonedx-json
           output-file: sbom.cdx.json
 
+      # Grype reads ./.grype.yaml (written above): baseline IDs on PRs, empty on main
       - name: Grype scan of the SBOM (fail on fixable high)
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
         with:

@@ -1,0 +1,42 @@
+name: Vulnerability drift (published image)
+
+on:
+  schedule:
+    - cron: "17 6 * * *" # daily, UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  scan:
+    name: Scan ghcr :latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - id: trivy
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ghcr.io/${{ github.repository }}:latest
+          format: table
+          output: drift.txt
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Open / update issue on fixable findings
+        if: steps.trivy.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          BODY=$(printf 'Published `:latest` has fixable HIGH/CRITICAL findings.\nFix: merge the pending Dependabot base bump, or bump the dependency.\n\n```\n%s\n```' "$(head -c 60000 drift.txt)")
+          EXISTING=$(gh issue list --repo "$REPO" --label vuln-drift --state open --json number -q '.[0].number')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "$REPO" --body "$BODY"
+          else
+            gh issue create --repo "$REPO" --label vuln-drift \
+              --title "Fixable vulnerabilities in published image" --body "$BODY"
+          fi
