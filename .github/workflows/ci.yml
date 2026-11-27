@@ -53,6 +53,7 @@ jobs:
               - 'requirements*.txt'
               - 'pyproject.toml'
               - '.github/workflows/ci.yml'
+              - '.python-version'
 
   lint:
     name: Lint Codebase
@@ -63,10 +64,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Set up Python 3.14
+      - name: Set up Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.14"
+          python-version-file: .python-version
           cache: "pip"
 
       - name: Install dev dependencies
@@ -84,10 +85,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Set up Python 3.14
+      - name: Set up Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.14"
+          python-version-file: .python-version
           cache: "pip"
 
       - name: Install dev dependencies
@@ -143,6 +144,17 @@ jobs:
             APP_VERSION=${{ env.SHORT_SHA }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name : Assert image Python matches .python-version
+        run: |
+          WANT=$(cut -d. -f1,2 .python-version)
+          GOT=$(docker run --rm --entrypoint /usr/bin/python netcalc-api:ci \
+                  -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')
+          echo "image Python: $GOT | CI tests on: $WANT"
+          if [ "$GOT" != "$WANT" ]; then
+            echo "::error::Base image ships Python $GOT but CI tests on $WANT. Update .python-version and regenerate the locks under $GOT."
+            exit 1
+          fi    
 
       # Differential gate (PR only, ADR-0016)
       # Baseline = last published image. `latest` only moves after every gate passed,
