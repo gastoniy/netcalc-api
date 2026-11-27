@@ -1,3 +1,12 @@
+# Daily absolute-policy scan of the PUBLISHED image (ADR-0016)
+#
+# With the differential PR gate, pull requests no longer surface CVEs that
+# appear in :latest after it was published. This job is where that drift is
+# detected: it opens (or comments on) a `vuln-drift` issue while fixable
+# HIGH/CRITICAL findings exist, and closes it once :latest is clean
+#
+# Not a required check - it reports, it never blocks
+
 name: Vulnerability drift (published image)
 
 on:
@@ -9,34 +18,59 @@ permissions:
   contents: read
   issues: write
 
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
 jobs:
   scan:
     name: Scan ghcr :latest
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}:latest
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
     steps:
-      - id: trivy
+      - name: Trivy (fail on fixable HIGH/CRITICAL)
+        id: trivy
         continue-on-error: true
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ghcr.io/${{ github.repository }}:latest
+          image-ref: ${{ env.IMAGE }}
           format: table
           output: drift.txt
           severity: CRITICAL,HIGH
           ignore-unfixed: true
           exit-code: "1"
 
-      - name: Open / update issue on fixable findings
+      - name: Open / update drift issue
         if: steps.trivy.outcome == 'failure'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
         run: |
-          BODY=$(printf 'Published `:latest` has fixable HIGH/CRITICAL findings.\nFix: merge the pending Dependabot base bump, or bump the dependency.\n\n```\n%s\n```' "$(head -c 60000 drift.txt)")
+          set -euo pipefail
+          REPORT=$( [ -f drift.txt ] && head -c 60000 drift.txt || echo "Trivy produced no report - check the run log: $GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID" )
+          BODY=$(printf 'Published `%s` has fixable HIGH/CRITICAL findings.\n\n**Fix:** merge the pending Dependabot base-image bump, or bump the affected dependency in `requirements.in`.\n\nRun: %s/%s/actions/runs/%s\n\n```\n%s\n```' \
+            "$IMAGE" "$GITHUB_SERVER_URL" "$REPO" "$GITHUB_RUN_ID" "$REPORT")
+
           EXISTING=$(gh issue list --repo "$REPO" --label vuln-drift --state open --json number -q '.[0].number')
           if [ -n "$EXISTING" ]; then
             gh issue comment "$EXISTING" --repo "$REPO" --body "$BODY"
           else
             gh issue create --repo "$REPO" --label vuln-drift \
-              --title "Fixable vulnerabilities in published image" --body "$BODY"
+              --title "Fixable vulnerabilities in published image" \
+              --body "$BODY"
           fi
+
+      - name: Close drift issue when clean
+        if: steps.trivy.outcome == 'success'
+        run: |
+          set -euo pipefail
+          for n in $(gh issue list --repo "$REPO" --label vuln-drift --state open --json number -q '.[].number'); do
+            gh issue close "$n" --repo "$REPO" \
+              --comment "Resolved: \`$IMAGE\` has no fixable HIGH/CRITICAL findings as of $(date -u +%Y-%m-%dT%H:%MZ)."
+          done
+
+      # Keep the run itself red while drift exists, so it is visible in the Actions tab too
+      - name: Fail run on drift
+        if: steps.trivy.outcome == 'failure'
+        run: exit 1

@@ -1,9 +1,7 @@
 [tool.ruff]
 line-length = 88
-# Tracks the runtime: the Chainguard base ships Python 3.14 (ADR-0003).
-# Requires ruff >= 0.11; older ruff rejects `py314` as a hard TOML parse error
-# (not a warning), so bump the pin in requirements-dev.in before touching this.
-target-version = "py314"
+
+target-version = "py315"
 
 [tool.ruff.lint]
 # pycodestyle, pyflakes, isort, bugbear, flake8-bandit (security).
